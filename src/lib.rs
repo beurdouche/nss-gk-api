@@ -26,6 +26,7 @@ pub mod hash;
 pub mod hkdf;
 pub mod hmac;
 pub mod p11;
+pub mod pkcs11_uri;
 mod prio;
 mod ssl;
 pub mod time;

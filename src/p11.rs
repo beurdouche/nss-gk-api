@@ -10,6 +10,7 @@
 #![allow(non_snake_case)]
 
 use crate::err::{secstatus_to_res, Error, Res};
+use crate::util::SECItemBorrowed;
 use crate::util::SECItemMut;
 
 use pkcs11_bindings::CKA_EC_POINT;
@@ -145,6 +146,103 @@ impl Slot {
     pub fn internal() -> Res<Self> {
         unsafe { Slot::from_ptr(PK11_GetInternalSlot()) }
     }
+
+    pub fn internal_key_slot() -> Res<Self> {
+        unsafe { Slot::from_ptr(PK11_GetInternalKeySlot()) }
+    }
+
+    pub fn token_name(&self) -> String {
+        let name = unsafe { PK11_GetTokenName(self.ptr) };
+        if name.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn authenticate(&self) -> Res<()> {
+        secstatus_to_res(unsafe {
+            PK11_Authenticate(self.ptr, PRBool::from(true), std::ptr::null_mut())
+        })
+    }
+
+    /// Find a persistent symmetric key on this slot by nickname.
+    /// Returns `None` if no key with the given nickname exists.
+    pub fn find_key_by_nickname(&self, nickname: &str) -> Option<SymKey> {
+        let c_nickname =
+            std::ffi::CString::new(nickname).ok()?;
+        let ptr = unsafe {
+            PK11_ListFixedKeysInSlot(
+                self.ptr,
+                c_nickname.as_ptr() as *mut _,
+                std::ptr::null_mut(),
+            )
+        };
+        if ptr.is_null() {
+            None
+        } else {
+            unsafe { SymKey::from_ptr(ptr).ok() }
+        }
+    }
+
+    /// Generate a persistent symmetric key on this slot with a nickname.
+    pub fn generate_token_key(
+        &self,
+        mechanism: CK_MECHANISM_TYPE,
+        key_size: usize,
+        nickname: &str,
+    ) -> Res<SymKey> {
+        let key = unsafe {
+            SymKey::from_ptr(PK11_TokenKeyGenWithFlags(
+                self.ptr,
+                mechanism,
+                std::ptr::null_mut(),
+                c_int::try_from(key_size).map_err(|_| Error::IntegerOverflow)?,
+                std::ptr::null_mut(),
+                CK_FLAGS::from(CKF_ENCRYPT | CKF_DECRYPT),
+                PK11AttrFlags::from(PK11_ATTR_TOKEN | PK11_ATTR_PRIVATE | PK11_ATTR_SENSITIVE),
+                std::ptr::null_mut(),
+            ))
+        }?;
+        let c_nickname =
+            std::ffi::CString::new(nickname).map_err(|_| Error::InvalidInput)?;
+        secstatus_to_res(unsafe {
+            PK11_SetSymKeyNickname(*key, c_nickname.as_ptr())
+        })?;
+        Ok(key)
+    }
+}
+
+/// Returns all available token slots for the given mechanism.
+pub fn all_token_slots(mechanism: CK_MECHANISM_TYPE) -> Res<Vec<Slot>> {
+    let list = unsafe {
+        PK11_GetAllTokens(
+            mechanism,
+            PRBool::from(false),
+            PRBool::from(false),
+            std::ptr::null_mut(),
+        )
+    };
+    if list.is_null() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    unsafe {
+        let mut elem = (*list).head;
+        while !elem.is_null() {
+            let slot_ptr = (*elem).slot;
+            if !slot_ptr.is_null() {
+                PK11_ReferenceSlot(slot_ptr);
+                if let Ok(slot) = Slot::from_ptr(slot_ptr) {
+                    result.push(slot);
+                }
+            }
+            elem = (*elem).next;
+        }
+        PK11_FreeSlotList(list);
+    }
+    Ok(result)
 }
 
 // Note: PK11SymKey is internally reference counted
